@@ -31,7 +31,6 @@ import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionStore } from "@opencode/core/session/store"
 import { SubagentJob } from "@opencode/core/session/subagent-job"
-import { SubagentMetadata } from "@opencode/core/session/subagent-metadata"
 import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
@@ -109,7 +108,6 @@ const executionNode = makeGlobalNode({
         resume: complete,
         wake: () => Effect.void,
         interrupt: () => Effect.succeed(false),
-        periodStartSeq: () => Effect.succeed(undefined),
         awaitIdle: (sessionID) => complete(sessionID).pipe(Effect.exit, Effect.asVoid),
       })
     }),
@@ -990,94 +988,12 @@ describe("SubagentTool reporting", () => {
       expect(reports[0]?.text).toContain("provider exploded")
     }),
   )
-
-  completionIt.live("keeps a silent child silent until a follow-up enables notify", () =>
-    Effect.gen(function* () {
-      const fixture = yield* reportingFixture()
-      const jobs = yield* Job.Service
-      const spawned = yield* fixture.call("call-silent-spawn", { notify: false })
-      const childID = outputSessionID(spawned.metadata)
-      expect(spawned.content).toEqual([
-        {
-          type: "text",
-          text: `The subagent is working in the background (sessionID: ${childID}) and will not notify you when it finishes, so you won't receive its result. Only use notify=false for work whose result you don't need. To send it more work, call subagent again with this sessionID.`,
-        },
-      ])
-      expect((yield* fixture.sessions.get(childID)).metadata).toEqual({ "subagent.notify": false })
-      yield* fixture.sessions.wait(childID)
-      yield* fixture.sessions.wait(fixture.parent.id)
-      expect(yield* fixture.notices).toEqual([])
-
-      // Omitted notify keeps the child silent across follow-ups.
-      const silent = yield* fixture.call("call-silent-follow", { sessionID: childID })
-      expect(silent.content).toEqual(spawned.content)
-      yield* fixture.sessions.wait(childID)
-      yield* fixture.sessions.wait(fixture.parent.id)
-      expect((yield* fixture.sessions.get(childID)).metadata).toEqual({ "subagent.notify": false })
-      expect(yield* fixture.notices).toEqual([])
-
-      const loud = yield* fixture.call("call-loud-follow", { sessionID: childID, notify: true })
-      expect(loud.content).toEqual([
-        {
-          type: "text",
-          text: expect.stringContaining(
-            "You will receive a <subagent> message when it goes idle, and again after each later round of work.",
-          ),
-        },
-      ])
-      yield* fixture.sessions.wait(childID)
-      yield* fixture.sessions.wait(fixture.parent.id)
-      expect((yield* fixture.sessions.get(childID)).metadata).toEqual({})
-      const reports = (yield* fixture.notices).filter((notice) => notice.metadata?.["source"] === "subagent")
-      expect(reports).toHaveLength(1)
-      expect(reports[0]?.text).toContain(`<subagent sessionID="${childID}" state="completed"`)
-      expect(yield* jobs.pendingBackground).toEqual([])
-    }),
-  )
-
-  completionIt.live("defaults a child of a silent parent to reporting", () =>
-    Effect.gen(function* () {
-      const dir = yield* tmpdirScoped()
-      const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
-      const sessions = yield* Session.Service
-      const parent = yield* sessions.create({
-        location,
-        model: parentModel,
-        metadata: { [SubagentMetadata.KEY]: false },
-      })
-      yield* withSubagent(parent.location)
-      const locations = yield* LocationServiceMap.Service
-      const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(parent.location)))
-
-      const spawned = yield* executeTool(registry, {
-        sessionID: parent.id,
-        ...toolIdentity,
-        call: {
-          type: "tool-call",
-          id: "call-silent-parent-child",
-          name: SubagentTool.name,
-          input: { agent: "reviewer", description: "review", prompt: "review this" },
-        },
-      })
-      const childID = outputSessionID(spawned.metadata)
-      // The link switch belongs to the child's link, not to the parent's own metadata.
-      expect((yield* sessions.get(childID)).metadata).toBeUndefined()
-      yield* sessions.wait(childID)
-      yield* sessions.wait(parent.id)
-      const delivered = (yield* sessions.context(parent.id))
-        .filter((message) => message.type === "synthetic")
-        .filter((message) => message.metadata?.["source"] === "subagent")
-      expect(delivered).toHaveLength(1)
-      expect(delivered[0]?.text).toContain(`<subagent sessionID="${childID}" state="completed"`)
-    }),
-  )
 })
 
 describe("SubagentJob cancellation", () => {
   it.live("interrupts the child only for an explicit cancel and preserves shutdown claims", () =>
     Effect.gen(function* () {
       const database = yield* Database.Service
-      const store = yield* SessionStore.Service
       const scope = yield* Scope.make()
       const cancelStarted = yield* Deferred.make<void>()
       const shutdownStarted = yield* Deferred.make<void>()
@@ -1100,7 +1016,6 @@ describe("SubagentJob cancellation", () => {
             Effect.onInterrupt(() => Effect.sync(() => interrupted.add(sessionID))),
           ),
         wake: () => Effect.void,
-        periodStartSeq: () => Effect.succeed(0),
         interrupt: (sessionID) =>
           Effect.sync(() => {
             interrupts.push(sessionID)
@@ -1113,9 +1028,7 @@ describe("SubagentJob cancellation", () => {
       const context = yield* Layer.buildWithScope(
         SubagentJob.layer.pipe(
           Layer.provide(Layer.succeed(SessionExecution.Service, execution)),
-          Layer.provide(Layer.succeed(SessionStore.Service, store)),
           Layer.provide(Layer.succeed(Job.Service, jobs)),
-          Layer.provide(Layer.succeed(Database.Service, database)),
         ),
         scope,
       )
@@ -1128,7 +1041,7 @@ describe("SubagentJob cancellation", () => {
         description: "review",
       })
 
-      yield* subagents.start(recovery("ses_job_cancel_parent", cancelChild), { background: true })
+      yield* subagents.start(recovery("ses_job_cancel_parent", cancelChild))
       yield* Deferred.await(cancelStarted)
       yield* jobs.cancel(cancelChild)
       expect(interrupted.has(cancelChild)).toBe(true)
@@ -1136,7 +1049,7 @@ describe("SubagentJob cancellation", () => {
       expect(claimed.has(cancelChild)).toBe(false)
 
       // A server shutdown interrupts the job fiber but must not release the child's claim.
-      yield* subagents.start(recovery("ses_job_shutdown_parent", shutdownChild), { background: true })
+      yield* subagents.start(recovery("ses_job_shutdown_parent", shutdownChild))
       yield* Deferred.await(shutdownStarted)
       yield* Scope.close(scope, Exit.void)
       expect(interrupted.has(shutdownChild)).toBe(true)
